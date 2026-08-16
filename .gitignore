@@ -1,0 +1,16 @@
+virtenv/
+venv/
+.venv/
+
+
+.env
+
+__pycache__/
+*.py[cod]
+*.pyo
+
+.vscode/
+.idea/
+
+storage/*
+!storage/.gitkeep
