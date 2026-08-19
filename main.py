@@ -14,6 +14,23 @@ app =FastAPI()
 STORGAE_DIR = "storage"
 os.makedirs(STORGAE_DIR, exist_ok=True)
 
+STORAGE_NODES = {
+    "node1": "http://127.0.0.1:9001",
+    "node2": "http://127.0.0.1:9002"
+}
+
+NODE_LIST = list(STORAGE_NODES.keys())
+current_node = 0
+
+def get_next_node():
+    global current_node
+
+    node_id = NODE_LIST[current_node]
+
+    current_node = (current_node + 1) % len(NODE_LIST)
+
+    return node_id
+
 
 @app.get("/")
 def home():
@@ -37,9 +54,12 @@ async def upload_file(
     
     file_id=str(uuid.uuid4())
 
+    node_id = get_next_node()
+    node_url = STORAGE_NODES[node_id]
+
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            "http://127.0.0.1:9001/store",
+            f"{node_url}/store",
             params={
                 "file_id" : file_id
             },
@@ -63,10 +83,10 @@ async def upload_file(
     new_file = FileModel(
         id = file_id,
         filename=file.filename,
-        path=f"node1_data/{file_id}",
+        path=f"{node_id}_data/{file_id}",
         size=0,
         content_type=file.content_type,
-        node_id = "node1"
+        node_id = node_id
     )
 
     db.add(new_file)
@@ -77,7 +97,7 @@ async def upload_file(
     return{
         "id": file_id,
         "filename" : file.filename,
-        "node_id": "node1",
+        "node_id": node_id,
         "message" : "File uploaded successfully"
     }
 
@@ -95,7 +115,13 @@ async def download_file(file_id: str,
             detail="File Not Found"
         )
 
-    node_url = "http://127.0.0.1:9001"
+    node_url = STORAGE_NODES.get(file_info.node_id)
+
+    if not node_url:
+        raise HTTPException(
+        status_code=500,
+        detail="Invalid storage node"
+        )
 
     async with httpx.AsyncClient() as client:
         response = await client.get(
@@ -130,7 +156,13 @@ async def delete_file(file_id : str,
                 detail="File Not Found"
             )
 
-    node_url = "http://127.0.0.1:9001"
+    node_url = STORAGE_NODES.get(file_info.node_id)
+
+    if not node_url:
+        raise HTTPException(
+            status_code=500,
+            detail="Invalid storage node"
+        )
 
     async with httpx.AsyncClient() as client:
 
