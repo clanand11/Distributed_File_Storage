@@ -1,8 +1,9 @@
 import os
 import uuid
+import httpx
 
 from fastapi import FastAPI, UploadFile, File , Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 
 from sqlalchemy.orm import Session
 from database import get_db
@@ -36,19 +37,36 @@ async def upload_file(
     
     file_id=str(uuid.uuid4())
 
-    file_path = os.path.join(STORGAE_DIR, f"{file_id}_{file.filename}")
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "http://127.0.0.1:9001/store",
+            params={
+                "file_id" : file_id
+            },
+            files = {
+                "file" : (
+                    file.filename,
+                    await file.read(),
+                    file.content_type
+                )
+            }
+        )
 
-    contents = await file.read()
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=500,
+            detail="Storage node failed to store the file"
+        )
 
-    with open(file_path,"wb") as f:
-        f.write(contents)
+    contents_size = response.headers.get("content-length")
 
     new_file = FileModel(
         id = file_id,
         filename=file.filename,
-        path=file_path,
-        size=len(contents),
-        content_type=file.content_type 
+        path=f"node1_data/{file_id}",
+        size=0,
+        content_type=file.content_type,
+        node_id = "node1"
     )
 
     db.add(new_file)
@@ -59,12 +77,13 @@ async def upload_file(
     return{
         "id": file_id,
         "filename" : file.filename,
+        "node_id": "node1",
         "message" : "File uploaded successfully"
     }
 
 
 @app.get("/files/{file_id}")
-def download_file(file_id: str, 
+async def download_file(file_id: str, 
                   db : Session = Depends(get_db)
                   ):
 
@@ -76,14 +95,30 @@ def download_file(file_id: str,
             detail="File Not Found"
         )
 
-    return FileResponse(
-        path=file_info.path,
-        filename=file_info.filename
+    node_url = "http://127.0.0.1:9001"
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{node_url}/retrieve/{file_id}"
+        )
+
+    if response.status_code == 404:
+        raise HTTPException(
+            status_code=500,
+            detail="Storage node failed to retrieve file"
+        )
+
+    return Response(
+        content = response.content,
+        media_type = file_info.content_type,
+        headers={
+            'Content-Disposition' : f'attachment; filename="{file_info.filename}"'
+        }
     )
 
 
 @app.delete("/files/{file_id}")
-def delete_file(file_id : str,
+async def delete_file(file_id : str,
                 db : Session = Depends(get_db)
                 ):
 
@@ -95,12 +130,30 @@ def delete_file(file_id : str,
                 detail="File Not Found"
             )
 
-    if os.path.exists(file_info.path):
-        os.remove(file_info.path)
+    node_url = "http://127.0.0.1:9001"
+
+    async with httpx.AsyncClient() as client:
+
+        response = await client.delete(
+            f'{node_url}/delete/{file_id}'
+        ) 
+
+    if response.status_code == 404:
+        raise HTTPException(
+            status_code=404,
+            detail="File not found on storage node"
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=500,
+            detail="Storage node failed to delete file"
+        )
 
     db.delete(file_info)
     db.commit()
 
     return {
-        "message" : "File deleted successfully"
+        "message" : "File deleted successfully",
+        "file_id" : file_id
     }

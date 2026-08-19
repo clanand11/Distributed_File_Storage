@@ -12,3 +12,4 @@ class FileModel(Base):
     size = Column(BigInteger, nullable=False)
     content_type = Column(Text)
     created_at = Column(DateTime, server_default=func.now())
+    node_id = Column(String(50), nullable=False)
