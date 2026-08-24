@@ -4,7 +4,7 @@ import os
 
 app = FastAPI()
 
-NODE_STORAGE = "storage_node/node2_data"
+NODE_STORAGE = "storage_node/node3_data"
 
 os.makedirs(NODE_STORAGE, exist_ok=True)
 

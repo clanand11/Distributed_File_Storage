@@ -16,11 +16,13 @@ os.makedirs(STORGAE_DIR, exist_ok=True)
 
 STORAGE_NODES = {
     "node1": "http://127.0.0.1:9001",
-    "node2": "http://127.0.0.1:9002"
+    "node2": "http://127.0.0.1:9002",
+    "node3": "http://127.0.0.1:9003"
 }
 
 NODE_LIST = list(STORAGE_NODES.keys())
 current_node = 0
+
 
 def get_next_node():
     global current_node
@@ -45,7 +47,6 @@ def list_files(db: Session = Depends(get_db)):
     return files
 
 
-
 @app.post("/upload")
 async def upload_file(
                     file: UploadFile = File(...),
@@ -54,52 +55,87 @@ async def upload_file(
     
     file_id=str(uuid.uuid4())
 
-    node_id = get_next_node()
-    node_url = STORAGE_NODES[node_id]
+    file_contents = await file.read()
+
+    primary_node_id = get_next_node()
+    primary_node_url = STORAGE_NODES[primary_node_id]
+
+    primary_index = NODE_LIST.index(primary_node_id)
+    replica_index = (primary_index + 1) % len(NODE_LIST)
+
+    replica_node_id = NODE_LIST[replica_index]
+    replica_node_url = STORAGE_NODES[replica_node_id]
 
     async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{node_url}/store",
+
+        primary_response = await client.post(
+            f"{primary_node_url}/store",
             params={
-                "file_id" : file_id
+                "file_id": file_id
             },
-            files = {
-                "file" : (
+            files={
+                "file": (
                     file.filename,
-                    await file.read(),
+                    file_contents,
                     file.content_type
                 )
             }
         )
 
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=500,
-            detail="Storage node failed to store the file"
-        )
+        if primary_response.status_code != 200:
+            raise HTTPException(
+                status_code=500,
+                detail="Primary storage node failed to store the file"
+            )  
 
-    contents_size = response.headers.get("content-length")
+        replica_response = await client.post(
+                    f"{replica_node_url}/store",
+                    params={
+                        "file_id": file_id
+                    },
+                    files={
+                        "file": (
+                            file.filename,
+                            file_contents,
+                            file.content_type
+                        )
+                    }
+                )
+        
+        if replica_response.status_code != 200:
+
+            await client.delete(
+                f"{primary_node_url}/delete/{file_id}"
+            )
+
+            raise HTTPException(
+                status_code=500,
+                detail="Replica storage node failed to store the file"
+            )    
 
     new_file = FileModel(
-        id = file_id,
+        id=file_id,
         filename=file.filename,
-        path=f"{node_id}_data/{file_id}",
-        size=0,
+        path=f"{primary_node_id}_data/{file_id}",
+        size=len(file_contents),
         content_type=file.content_type,
-        node_id = node_id
-    )
+        node_id=primary_node_id,
+        replica_node_id=replica_node_id
+    ) 
 
     db.add(new_file)
     db.commit()
     db.refresh(new_file)
 
-
-    return{
+    return {
         "id": file_id,
-        "filename" : file.filename,
-        "node_id": node_id,
-        "message" : "File uploaded successfully"
+        "filename": file.filename,
+        "primary_node": primary_node_id,
+        "replica_node": replica_node_id,
+        "message": "File uploaded and replicated successfully"
     }
+
+    
 
 
 @app.get("/files/{file_id}")

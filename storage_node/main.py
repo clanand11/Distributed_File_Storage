@@ -8,11 +8,13 @@ NODE_STORAGE = "storage_node/node1_data"
 
 os.makedirs(NODE_STORAGE, exist_ok=True)
 
+
 @app.get("/health")
 def health():
     return {
         "status" : "healthy"
     }
+
 
 @app.post("/store")
 async def store_file(
@@ -31,6 +33,7 @@ async def store_file(
         "file_id" : file_id
     }
 
+
 @app.get("/retrieve/{file_id}")
 def retrieve_file(file_id : str):
     file_path = os.path.join(NODE_STORAGE,file_id)
@@ -42,6 +45,7 @@ def retrieve_file(file_id : str):
         )
 
     return FileResponse(path=file_path)
+
 
 @app.delete("/delete/{file_id}")
 def delete_file(file_id : str):

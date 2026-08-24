@@ -13,3 +13,4 @@ class FileModel(Base):
     content_type = Column(Text)
     created_at = Column(DateTime, server_default=func.now())
     node_id = Column(String(50), nullable=False)
+    replica_node_id = Column(String(50),nullable=False)
