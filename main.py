@@ -1,15 +1,17 @@
 import os
 import uuid
 import httpx
+import asyncio
+
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File , Depends, HTTPException
 from fastapi.responses import Response
 
 from sqlalchemy.orm import Session
-from database import get_db
+from database import get_db, SessionLocal
 from models import FileModel
 
-app =FastAPI()
 
 STORGAE_DIR = "storage"
 os.makedirs(STORGAE_DIR, exist_ok=True)
@@ -23,6 +25,11 @@ STORAGE_NODES = {
 NODE_LIST = list(STORAGE_NODES.keys())
 current_node = 0
 
+NODE_STATUS = {
+    node_id: False
+    for node_id in STORAGE_NODES
+}
+
 
 def get_next_node():
     global current_node
@@ -32,6 +39,118 @@ def get_next_node():
     current_node = (current_node + 1) % len(NODE_LIST)
 
     return node_id
+
+
+async def check_node_health(node_id:str, node_url: str):
+
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.get(
+                f"{node_url}/health"
+            )
+
+            # print(
+            #     f"{node_id} → "
+            #     f"{response.status_code} → "
+            #     f"{response.text}"
+            # )
+
+            if response.status_code == 200:
+                return True
+
+    except httpx.RequestError:
+        pass
+
+    # except  Exception as e:
+    #     print(
+    #         f"{node_id} -> Error -> {repr(e)}"
+    #     )
+
+    return False
+
+
+async def monitor_nodes():
+    while True:
+        for node_id, node_url in STORAGE_NODES.items():
+
+            NODE_STATUS[node_id] = await check_node_health(node_id,node_url)
+
+        await process_pending_deletions()
+
+        await asyncio.sleep(10)
+
+async def process_pending_deletions():
+
+    db = SessionLocal()
+
+    try:
+
+        pending_files = db.query(FileModel).filter(
+            FileModel.deletion_pending == True
+        ).all()
+
+        async with httpx.AsyncClient(timeout=5.0) as client:
+
+            for file_info in pending_files:
+
+                nodes = [
+                    file_info.node_id,
+                    file_info.replica_node_id
+                ]
+
+                all_deleted = True
+
+                for node_id in nodes:
+
+                    if not NODE_STATUS.get(node_id, False):
+                        all_deleted = False
+                        continue
+
+                    node_url = STORAGE_NODES[node_id]
+
+                    try:
+
+                        response = await client.delete(
+                            f"{node_url}/delete/{file_info.id}"
+                        )
+
+                        if response.status_code not in [200, 404]:
+                            all_deleted = False
+
+                    except httpx.RequestError:
+
+                        all_deleted = False
+
+                if all_deleted:
+
+                    db.delete(file_info)
+
+            db.commit()
+
+    finally:
+
+        db.close()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    monitoring_task = asyncio.create_task(monitor_nodes())
+
+    yield
+
+    monitoring_task.cancel()
+
+    try:
+        await monitoring_task
+    except asyncio.CancelledError:
+        pass
+
+app =FastAPI(lifespan=lifespan)
+
+@app.get("/nodes/status")
+def node_status():
+
+    return NODE_STATUS
+
 
 
 @app.get("/")
@@ -151,31 +270,61 @@ async def download_file(file_id: str,
             detail="File Not Found"
         )
 
-    node_url = STORAGE_NODES.get(file_info.node_id)
+    primary_url = STORAGE_NODES.get(file_info.node_id)
+    replica_url = STORAGE_NODES.get(file_info.replica_node_id)
 
-    if not node_url:
+    if not primary_url:
         raise HTTPException(
         status_code=500,
-        detail="Invalid storage node"
+        detail="Invalid primary storage node"
+        )
+    
+    if not replica_url:
+        raise HTTPException(
+        status_code=500,
+        detail="Invalid replica storage node"
         )
 
     async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f"{node_url}/retrieve/{file_id}"
-        )
+        try:
+            response = await client.get(
+                f"{primary_url}/retrieve/{file_id}"
+            )
 
-    if response.status_code == 404:
-        raise HTTPException(
-            status_code=500,
-            detail="Storage node failed to retrieve file"
-        )
+            if response.status_code == 200:
+                return Response(
+                    content=response.content,
+                    media_type=file_info.content_type,
+                    headers={
+                        "Content-Disposition":
+                        f'attachment; filename="{file_info.filename}"'
+                    }
+                )
 
-    return Response(
-        content = response.content,
-        media_type = file_info.content_type,
-        headers={
-            'Content-Disposition' : f'attachment; filename="{file_info.filename}"'
-        }
+        except httpx.RequestError:
+            pass
+
+        try:
+            response = await client.get(
+                f"{replica_url}/retrieve/{file_id}"
+            )
+
+            if response.status_code == 200:
+                return Response(
+                    content=response.content,
+                    media_type=file_info.content_type,
+                    headers={
+                        "Content-Disposition":
+                        f'attachment; filename="{file_info.filename}"'
+                    }
+                )
+
+        except httpx.RequestError:
+            pass
+
+    raise HTTPException(
+        status_code=503,
+        detail="File unavailable on both storage nodes"
     )
 
 
@@ -192,9 +341,10 @@ async def delete_file(file_id : str,
                 detail="File Not Found"
             )
 
-    node_url = STORAGE_NODES.get(file_info.node_id)
+    primary_url = STORAGE_NODES.get(file_info.node_id)
+    replica_url = STORAGE_NODES.get(file_info.replica_node_id)
 
-    if not node_url:
+    if not primary_url or not replica_url:
         raise HTTPException(
             status_code=500,
             detail="Invalid storage node"
@@ -202,26 +352,46 @@ async def delete_file(file_id : str,
 
     async with httpx.AsyncClient() as client:
 
-        response = await client.delete(
-            f'{node_url}/delete/{file_id}'
-        ) 
+        primary_deleted = False
+        replica_deleted = False
 
-    if response.status_code == 404:
-        raise HTTPException(
-            status_code=404,
-            detail="File not found on storage node"
-        )
+        try:
+            response = await client.delete(
+                f"{primary_url}/delete/{file_id}"
+            )
 
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=500,
-            detail="Storage node failed to delete file"
-        )
+            if response.status_code in [200,404]:
+                primary_deleted = True
 
-    db.delete(file_info)
+        except httpx.RequestError:
+            pass
+
+        try: 
+            response = await client.delete(
+                f"{replica_url}/delete/{file_id}"
+            )
+
+            if response.status_code in [200,404]:
+                replica_deleted = True
+
+        except httpx.RequestError:
+            pass
+
+    if primary_deleted and replica_deleted:
+        
+        db.delete(file_info)
+        db.commit()
+
+        return {
+            "message": "File deleted successfully from all replicas",
+            "file_id": file_id
+        }
+
+    file_info.deletion_pending = True
+
     db.commit()
 
     return {
-        "message" : "File deleted successfully",
-        "file_id" : file_id
+        "message": "File deletion pending until unavailable node recovers",
+        "file_id": file_id
     }

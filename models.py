@@ -1,4 +1,4 @@
-from sqlalchemy import Column,String,Text,BigInteger,DateTime
+from sqlalchemy import Column,String,Text,BigInteger,DateTime, Boolean
 from sqlalchemy.sql import func
 
 from database import Base
@@ -14,3 +14,4 @@ class FileModel(Base):
     created_at = Column(DateTime, server_default=func.now())
     node_id = Column(String(50), nullable=False)
     replica_node_id = Column(String(50),nullable=False)
+    deletion_pending = Column(Boolean, default=False, nullable=False)
