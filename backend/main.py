@@ -3,6 +3,7 @@ import uuid
 import httpx
 import asyncio
 
+from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File , Depends, HTTPException
@@ -12,15 +13,19 @@ from sqlalchemy.orm import Session
 from database import get_db, SessionLocal
 from models import FileModel
 
+from fastapi.middleware.cors import CORSMiddleware
 
-STORGAE_DIR = "storage"
-os.makedirs(STORGAE_DIR, exist_ok=True)
+load_dotenv()
+
 
 STORAGE_NODES = {
-    "node1": "http://127.0.0.1:9001",
-    "node2": "http://127.0.0.1:9002",
-    "node3": "http://127.0.0.1:9003"
+    "node1": os.getenv("NODE1_URL"),
+    "node2": os.getenv("NODE2_URL"),
+    "node3": os.getenv("NODE3_URL")
 }
+
+if any(url is None for url in STORAGE_NODES.values()):
+    raise RuntimeError("Storage node configuration is missing")
 
 NODE_LIST = list(STORAGE_NODES.keys())
 current_node = 0
@@ -34,50 +39,70 @@ NODE_STATUS = {
 def get_next_node():
     global current_node
 
-    node_id = NODE_LIST[current_node]
+    for _ in range(len(NODE_LIST)):
+        node_id = NODE_LIST[current_node]
 
-    current_node = (current_node + 1) % len(NODE_LIST)
+        current_node = (current_node + 1) % len(NODE_LIST)
 
-    return node_id
+        if NODE_STATUS[node_id]:
+            return node_id
+
+    return None
+
+def get_replica_node(primary_node_id):
+
+    primary_index = NODE_LIST.index(primary_node_id)
+
+    for i in range(1,len(NODE_LIST)):
+
+        replica_index = (primary_index + i) % len(NODE_LIST)
+
+        replica_node_id = NODE_LIST[replica_index] 
+
+        if NODE_STATUS[replica_node_id]:
+            return replica_node_id
+
+    return None
+        
 
 
 async def check_node_health(node_id:str, node_url: str):
 
     try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 f"{node_url}/health"
             )
-
-            # print(
-            #     f"{node_id} → "
-            #     f"{response.status_code} → "
-            #     f"{response.text}"
-            # )
-
+            
             if response.status_code == 200:
                 return True
 
-    except httpx.RequestError:
-        pass
+    except httpx.RequestError as e:
+        print(f"[HEALTH ERROR] {node_id}: {repr(e)}")
 
-    # except  Exception as e:
-    #     print(
-    #         f"{node_id} -> Error -> {repr(e)}"
-    #     )
 
     return False
 
 
 async def monitor_nodes():
+
     while True:
-        for node_id, node_url in STORAGE_NODES.items():
 
-            NODE_STATUS[node_id] = await check_node_health(node_id,node_url)
+        try:
+            for node_id, node_url in STORAGE_NODES.items():
 
-        await process_pending_deletions()
+                NODE_STATUS[node_id] = await check_node_health(node_id,node_url)
+
+            await process_pending_deletions()
+
+            await recover_missing_replicas()
+
+        except Exception as e:
+            print(f"[Monitor Error] {repr(e)}")
 
         await asyncio.sleep(10)
+
+
 
 async def process_pending_deletions():
 
@@ -89,7 +114,7 @@ async def process_pending_deletions():
             FileModel.deletion_pending == True
         ).all()
 
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
 
             for file_info in pending_files:
 
@@ -131,6 +156,87 @@ async def process_pending_deletions():
 
         db.close()
 
+
+async def recover_missing_replicas():
+
+    db = SessionLocal()
+
+    try:
+        files = db.query(FileModel).filter(FileModel.deletion_pending == False).all()
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+
+            for file_info in files:
+
+                primary_node_id = file_info.node_id
+                replica_node_id = file_info.replica_node_id
+
+                primary_url = STORAGE_NODES.get(primary_node_id)
+                replica_url = STORAGE_NODES.get(replica_node_id)
+
+                if not primary_url or not replica_url:
+                    continue
+
+                if not NODE_STATUS.get(primary_node_id, False):
+                    continue
+
+                if not NODE_STATUS.get(replica_node_id, False):
+                    continue
+
+                try:
+                    response = await client.get(
+                        f"{replica_url}/retrieve/{file_info.id}"
+                    )
+
+                    if response.status_code == 200:
+                        continue
+
+                except httpx.RequestError:
+                    continue
+
+                try:
+                    response = await client.get(
+                        f"{primary_url}/retrieve/{file_info.id}"
+                    )
+
+                    if response.status_code != 200:
+                        continue
+                except httpx.RequestError:
+                    continue
+
+                try:
+
+                    store_response = await client.post(
+                        f"{replica_url}/store",
+                        params={
+                            "file_id": file_info.id
+                        },
+                        files={
+                            "file": (
+                                file_info.filename,
+                                response.content,
+                                file_info.content_type
+                            )
+                        }
+                    )
+
+                    if store_response.status_code == 200:
+
+                        print(
+                            f"Replica recovered: "
+                            f"{file_info.id} → "
+                            f"{replica_node_id}"
+                        )
+
+                except httpx.RequestError:
+                    continue
+
+    finally:
+
+        db.close()
+
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     monitoring_task = asyncio.create_task(monitor_nodes())
@@ -144,7 +250,15 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
-app =FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/nodes/status")
 def node_status():
@@ -177,15 +291,26 @@ async def upload_file(
     file_contents = await file.read()
 
     primary_node_id = get_next_node()
+
+    if not primary_node_id:
+        raise HTTPException(
+            status_code=503,
+            detail="No healthy storage nodes available"
+        )
+
     primary_node_url = STORAGE_NODES[primary_node_id]
 
-    primary_index = NODE_LIST.index(primary_node_id)
-    replica_index = (primary_index + 1) % len(NODE_LIST)
+    replica_node_id = get_replica_node(primary_node_id)
 
-    replica_node_id = NODE_LIST[replica_index]
+    if not replica_node_id:
+        raise HTTPException(
+            status_code=503,
+            detail="No healthy replica node available"
+        )
+
     replica_node_url = STORAGE_NODES[replica_node_id]
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
 
         primary_response = await client.post(
             f"{primary_node_url}/store",
@@ -232,19 +357,41 @@ async def upload_file(
                 detail="Replica storage node failed to store the file"
             )    
 
-    new_file = FileModel(
-        id=file_id,
-        filename=file.filename,
-        path=f"{primary_node_id}_data/{file_id}",
-        size=len(file_contents),
-        content_type=file.content_type,
-        node_id=primary_node_id,
-        replica_node_id=replica_node_id
-    ) 
+        new_file = FileModel(
+            id=file_id,
+            filename=file.filename,
+            path=f"{primary_node_id}_data/{file_id}",
+            size=len(file_contents),
+            content_type=file.content_type,
+            node_id=primary_node_id,
+            replica_node_id=replica_node_id
+        ) 
 
-    db.add(new_file)
-    db.commit()
-    db.refresh(new_file)
+        try:
+            db.add(new_file)
+            db.commit()
+            db.refresh(new_file)
+        except Exception:
+            db.rollback()
+
+            try:
+                await client.delete(
+                f"{primary_node_url}/delete/{file_id}"
+                )
+            except httpx.RequestError:
+                pass
+
+            try:
+                await client.delete(
+                    f"{replica_node_url}/delete/{file_id}"
+                )
+            except httpx.RequestError:
+                pass
+
+            raise HTTPException(
+                status_code=500,
+                detail="Database operation failed; upload rolled back"
+            )
 
     return {
         "id": file_id,
@@ -285,7 +432,7 @@ async def download_file(file_id: str,
         detail="Invalid replica storage node"
         )
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             response = await client.get(
                 f"{primary_url}/retrieve/{file_id}"
@@ -350,7 +497,7 @@ async def delete_file(file_id : str,
             detail="Invalid storage node"
         )
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
 
         primary_deleted = False
         replica_deleted = False

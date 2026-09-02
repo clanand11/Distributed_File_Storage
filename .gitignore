@@ -1,16 +1,21 @@
-virtenv/
-venv/
-.venv/
-
-
-.env
-
+# Python
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
+*.pyd
 
-.vscode/
-.idea/
+# Virtual environment
+virtenv/
 
-storage/*
-!storage/.gitkeep
+# Environment variables
+.env
+backend/.env
+
+# Storage node generated files
+storage_node/node1_data/*
+storage_node/node2_data/*
+storage_node/node3_data/*
+
+# React
+frontend/node_modules/
+frontend/dist/

@@ -1,0 +1,37 @@
+.app {
+  min-height: 100vh;
+  padding: 40px;
+  text-align: center;
+}
+
+.app h1 {
+  margin-bottom: 40px;
+}
+
+.nodes {
+  display: flex;
+  justify-content: center;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+.node {
+  width: 180px;
+  padding: 20px;
+  border: 1px solid #ccc;
+  border-radius: 10px;
+}
+
+.healthy {
+  color: green;
+  font-weight: bold;
+}
+
+.offline {
+  color: red;
+  font-weight: bold;
+}
+
+.error {
+  color: red;
+}
